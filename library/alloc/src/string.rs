@@ -725,28 +725,120 @@ impl String {
     #[cfg(not(no_global_oom_handling))]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn from_utf16(v: &[u16]) -> Result<String, FromUtf16Error> {
-        Self::from_utf16_units(v.iter().cloned(), v.len())
+        Self::from_utf16_units_strict(|i| v[i], v.len())
     }
 
-    /// Decodes an iterator of UTF-16 code units into a `String`, returning
-    /// [`Err`] on the first lone surrogate. `capacity` should be the number of
-    /// code units, which is used to preallocate the output buffer.
+    /// Decodes one code unit (one UTF-16 unit, or a surrogate pair) starting at `i` of the
+    /// `n` code units read through `unit_at`. Returns the decoded char and the number of code
+    /// units consumed: `None` is a lone surrogate, which consumes one unit.
+    #[cfg(not(no_global_oom_handling))]
+    #[inline]
+    fn decode_utf16_at(
+        unit_at: &impl Fn(usize) -> u16,
+        i: usize,
+        n: usize,
+    ) -> (Option<char>, usize) {
+        let first = unit_at(i);
+        if (0xD800..=0xDBFF).contains(&first) {
+            if i + 1 < n {
+                let second = unit_at(i + 1);
+                if (0xDC00..=0xDFFF).contains(&second) {
+                    // SAFETY: `first` is a high surrogate and `second` a low surrogate, so
+                    // the computed scalar value is in `0x10000..=0x10FFFF`.
+                    let code =
+                        0x10000 + (((first as u32) - 0xD800) << 10) + ((second as u32) - 0xDC00);
+                    return (Some(unsafe { char::from_u32_unchecked(code) }), 2);
+                }
+            }
+            (None, 1)
+        } else if (0xDC00..=0xDFFF).contains(&first) {
+            (None, 1)
+        } else {
+            // SAFETY: a code unit that is not a surrogate is a valid Unicode scalar value.
+            (Some(unsafe { char::from_u32_unchecked(first as u32) }), 1)
+        }
+    }
+
+    /// Decodes an indexed sequence of UTF-16 code units into a `String`. Returns the string and
+    /// whether the input was valid (no lone surrogate); lone surrogates are encoded as
+    /// [`char::REPLACEMENT_CHARACTER`] in both cases.
+    ///
+    /// ASCII fast path: scans the units once; when every unit is below `0x80`, allocates
+    /// exactly `capacity` bytes and writes one byte per unit. Otherwise falls back to
+    /// [`String::from_utf16_units_slow`].
+    #[cfg(not(no_global_oom_handling))]
+    #[inline]
+    fn from_utf16_units(unit_at: impl Fn(usize) -> u16, capacity: usize) -> (String, bool) {
+        let mut i = 0;
+        let mut ascii = true;
+        while i < capacity {
+            if unit_at(i) >= 0x80 {
+                ascii = false;
+                break;
+            }
+            i += 1;
+        }
+        if ascii {
+            let mut ret = String::with_capacity(capacity);
+            let buf = ret.vec.as_mut_ptr();
+            let mut j = 0;
+            while j < capacity {
+                // SAFETY: `j < capacity` and `buf` has `capacity` bytes; the scan found every
+                // unit below `0x80`, so the byte is that unit's one-byte UTF-8 encoding.
+                unsafe { *buf.add(j) = unit_at(j) as u8 };
+                j += 1;
+            }
+            // SAFETY: every byte in `0..capacity` was written with a one-byte encoding.
+            unsafe { ret.vec.set_len(capacity) };
+            return (ret, true);
+        }
+        Self::from_utf16_units_slow(unit_at, capacity)
+    }
+
+    /// The non-ASCII fallback of [`String::from_utf16_units`]. The buffer is preallocated for
+    /// the worst case of three UTF-8 bytes per code unit (a surrogate pair yields four bytes for
+    /// two units), and the loop writes each encoded char straight into it, so nothing inside the
+    /// loop allocates or reallocates. `len` is the number of bytes written so far; the
+    /// `String`'s length is set once, after the loop.
     // This isn't done via collect::<Result<_, _>>() for performance reasons.
     // FIXME: the function can be simplified again when #48994 is closed.
     #[cfg(not(no_global_oom_handling))]
     #[inline]
-    fn from_utf16_units(
-        units: impl Iterator<Item = u16>,
+    fn from_utf16_units_slow(unit_at: impl Fn(usize) -> u16, capacity: usize) -> (String, bool) {
+        let mut ret = String::with_capacity(3 * capacity);
+        let buf = ret.vec.as_mut_ptr();
+        let mut i = 0;
+        let mut len = 0usize;
+        // A lone surrogate is encoded as U+FFFD and the scan continues; the caller turns
+        // `valid == false` into `Err`.
+        let mut valid = true;
+        while i < capacity {
+            let (c, used) = Self::decode_utf16_at(&unit_at, i, capacity);
+            i += used;
+            valid = valid && c.is_some();
+            let c = c.unwrap_or(char::REPLACEMENT_CHARACTER);
+            let ch_len = c.len_utf8();
+            // SAFETY: `len + ch_len <= 3 * capacity`, and the buffer has at least
+            // `3 * capacity` bytes, so the write stays inside the allocation.
+            unsafe { core::char::encode_utf8_raw_unchecked(c as u32, buf.add(len)) };
+            len += ch_len;
+        }
+        // SAFETY: `buf[..len]` was written by the loop as the UTF-8 encodings of the decoded
+        // chars, so it is initialized and valid UTF-8, and `len <= 3 * capacity`, within the
+        // allocation.
+        unsafe { ret.vec.set_len(len) };
+        (ret, valid)
+    }
+
+    /// Strict wrapper around [`String::from_utf16_units`]: a lone surrogate is an error.
+    #[cfg(not(no_global_oom_handling))]
+    #[inline]
+    fn from_utf16_units_strict(
+        unit_at: impl Fn(usize) -> u16,
         capacity: usize,
     ) -> Result<String, FromUtf16Error> {
-        let mut ret = String::with_capacity(capacity);
-        for c in char::decode_utf16(units) {
-            let Ok(c) = c else {
-                return Err(FromUtf16Error { kind: FromUtf16ErrorKind::LoneSurrogate });
-            };
-            ret.push(c);
-        }
-        Ok(ret)
+        let (s, valid) = Self::from_utf16_units(unit_at, capacity);
+        if valid { Ok(s) } else { Err(FromUtf16Error { kind: FromUtf16ErrorKind::LoneSurrogate }) }
     }
 
     /// Decode a native endian UTF-16–encoded slice `v` into a `String`,
@@ -776,9 +868,7 @@ impl String {
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn from_utf16_lossy(v: &[u16]) -> String {
-        char::decode_utf16(v.iter().cloned())
-            .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
-            .collect()
+        Self::from_utf16_units(|i| v[i], v.len()).0
     }
 
     /// Decode a UTF-16LE–encoded vector `v` into a `String`,
@@ -809,9 +899,7 @@ impl String {
         // SAFETY: The aligned part of `v` can be transmuted into a valid u16 slice.
         match (cfg!(target_endian = "little"), unsafe { v.align_to::<u16>() }) {
             (true, ([], v, [])) => Self::from_utf16(v),
-            _ => {
-                Self::from_utf16_units(chunks.iter().copied().map(u16::from_le_bytes), chunks.len())
-            }
+            _ => Self::from_utf16_units_strict(|i| u16::from_le_bytes(chunks[i]), chunks.len()),
         }
     }
 
@@ -848,9 +936,8 @@ impl String {
             (true, ([], v, [_remainder])) => Self::from_utf16_lossy(v) + "\u{FFFD}",
             _ => {
                 let (chunks, remainder) = v.as_chunks::<2>();
-                let string = char::decode_utf16(chunks.iter().copied().map(u16::from_le_bytes))
-                    .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
-                    .collect();
+                let string =
+                    Self::from_utf16_units(|i| u16::from_le_bytes(chunks[i]), chunks.len()).0;
                 if remainder.is_empty() { string } else { string + "\u{FFFD}" }
             }
         }
@@ -884,9 +971,7 @@ impl String {
         // SAFETY: The aligned part of `v` can be transmuted into a valid u16 slice.
         match (cfg!(target_endian = "big"), unsafe { v.align_to::<u16>() }) {
             (true, ([], v, [])) => Self::from_utf16(v),
-            _ => {
-                Self::from_utf16_units(chunks.iter().copied().map(u16::from_be_bytes), chunks.len())
-            }
+            _ => Self::from_utf16_units_strict(|i| u16::from_be_bytes(chunks[i]), chunks.len()),
         }
     }
 
@@ -923,9 +1008,8 @@ impl String {
             (true, ([], v, [_remainder])) => Self::from_utf16_lossy(v) + "\u{FFFD}",
             _ => {
                 let (chunks, remainder) = v.as_chunks::<2>();
-                let string = char::decode_utf16(chunks.iter().copied().map(u16::from_be_bytes))
-                    .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
-                    .collect();
+                let string =
+                    Self::from_utf16_units(|i| u16::from_be_bytes(chunks[i]), chunks.len()).0;
                 if remainder.is_empty() { string } else { string + "\u{FFFD}" }
             }
         }
